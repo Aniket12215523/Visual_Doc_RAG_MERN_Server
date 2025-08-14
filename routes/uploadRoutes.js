@@ -21,11 +21,17 @@ const storage = multer.diskStorage({
     cb(null, `${unique}${path.extname(file.originalname)}`);
   }
 });
-const upload = multer({ storage });
+
+const upload = multer({ 
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit to prevent crashes
+    files: 3 // Limit number of files
+  }
+});
 
 // SSE endpoint for real-time progress updates
 router.get('/progress/:sessionId', (req, res) => {
-  // Set SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -36,26 +42,22 @@ router.get('/progress/:sessionId', (req, res) => {
 
   const sessionId = req.params.sessionId;
   
-  // Store SSE connection
   if (!req.app.locals.sseConnections) {
     req.app.locals.sseConnections = {};
   }
   req.app.locals.sseConnections[sessionId] = res;
 
-  // Send connection confirmation
   res.write(`data: ${JSON.stringify({ 
     type: 'info', 
     emoji: '🔗', 
     message: 'Connected to processing stream' 
   })}\n\n`);
 
-  // Handle client disconnect
   req.on('close', () => {
     delete req.app.locals.sseConnections[sessionId];
   });
 });
 
-// Helper function to send SSE updates
 function sendProgressUpdate(app, sessionId, type, emoji, message) {
   const connection = app.locals.sseConnections?.[sessionId];
   if (connection) {
@@ -65,15 +67,19 @@ function sendProgressUpdate(app, sessionId, type, emoji, message) {
       console.warn('Failed to send SSE update:', error.message);
     }
   }
-  // Always log to console as well
   console.log(`${emoji} ${message}`);
 }
 
-// Updated upload endpoint with real-time progress
+// ✅ CRITICAL FIX: Updated upload endpoint with proper error handling
 router.post('/', upload.array('files'), async (req, res) => {
+  // ✅ Add timeout protection
+  req.setTimeout(300000); // 5 minutes
+  res.setTimeout(300000);
+  
   const sessionId = req.headers['x-session-id'] || Date.now().toString();
   
   console.log('📤 Upload endpoint hit');
+  console.log('Memory usage:', process.memoryUsage()); // Monitor memory
   console.log('Files received:', req.files);
   
   sendProgressUpdate(req.app, sessionId, 'info', '📤', 'Upload endpoint hit');
@@ -83,8 +89,16 @@ router.post('/', upload.array('files'), async (req, res) => {
     return res.status(400).json({ ok: false, error: 'No files uploaded' });
   }
 
+  // ✅ Check file sizes
+  const totalSize = req.files.reduce((sum, file) => sum + file.size, 0);
+  if (totalSize > 10 * 1024 * 1024) { // 10MB total limit
+    sendProgressUpdate(req.app, sessionId, 'error', '❌', 'Files too large');
+    return res.status(400).json({ ok: false, error: 'Files too large. Max 10MB total.' });
+  }
+
   sendProgressUpdate(req.app, sessionId, 'info', '📄', `Processing ${req.files.length} file(s)`);
 
+  // ✅ WRAP EVERYTHING IN TRY-CATCH
   try {
     const ingested = [];
     
@@ -93,19 +107,23 @@ router.post('/', upload.array('files'), async (req, res) => {
       console.log(`Processing file: ${f.path}`);
       sendProgressUpdate(req.app, sessionId, 'processing', '🔄', `Processing file: ${f.originalname}`);
       
-      // Create progress callback for this file
       const progressCallback = (step, current, total, extraInfo = '') => {
         sendProgressUpdate(req.app, sessionId, ...step, current, total, extraInfo);
       };
       
-      const result = await processFileAndIndex(f.path, docId, f.mimetype, progressCallback);
+      // ✅ Add individual file processing timeout
+      const fileProcessingPromise = processFileAndIndex(f.path, docId, f.mimetype, progressCallback);
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('File processing timeout')), 240000); // 4 minutes
+      });
+      
+      const result = await Promise.race([fileProcessingPromise, timeoutPromise]);
       ingested.push({ docId, ...result });
     }
 
     const totalChunks = ingested.reduce((a, b) => a + (b.count || 0), 0);
     sendProgressUpdate(req.app, sessionId, 'success', '🎉', `Processing complete! Total chunks: ${totalChunks}`);
     
-    // Close SSE connection after a delay
     setTimeout(() => {
       const connection = req.app.locals.sseConnections?.[sessionId];
       if (connection) {
@@ -117,10 +135,31 @@ router.post('/', upload.array('files'), async (req, res) => {
 
     res.json({ ok: true, ingested });
     
-  } catch (e) {
-    console.error('❌ Error during ingestion:', e);
-    sendProgressUpdate(req.app, sessionId, 'error', '❌', `Error during ingestion: ${e.message}`);
-    res.status(500).json({ ok: false, error: e.message });
+  } catch (error) {
+    console.error('❌ Error during ingestion:', error);
+    console.error('❌ Stack trace:', error.stack);
+    sendProgressUpdate(req.app, sessionId, 'error', '❌', `Error: ${error.message}`);
+    
+    // ✅ Ensure SSE connection is closed on error
+    const connection = req.app.locals.sseConnections?.[sessionId];
+    if (connection) {
+      try {
+        connection.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
+        connection.end();
+      } catch (e) {
+        console.warn('Failed to close SSE connection:', e.message);
+      }
+      delete req.app.locals.sseConnections[sessionId];
+    }
+    
+    // ✅ Send proper error response
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        ok: false, 
+        error: error.message || 'Processing failed',
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
+    }
   }
 });
 
