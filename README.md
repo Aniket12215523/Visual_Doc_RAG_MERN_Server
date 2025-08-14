@@ -18,7 +18,7 @@ Create a **Vector Search Index** in **MongoDB Atlas** on collection `chunks`:
     {
       "type": "vector",
       "path": "vector",
-      "numDimensions": 1536,
+      "numDimensions": 356,
       "similarity": "cosine"
     }
   ]
@@ -33,14 +33,14 @@ npm i
 npm run dev
 ```
 
-Open the URL from Vite (usually http://localhost:5173).
+Open the URL for deployed link : (https://visual-doc-rag-mern-client.vercel.app/)
 
 ## API
 - `POST /api/upload` (multipart form) => `files[]`: PDFs/Images. Ingests, OCRs, chunks, embeds, writes to Mongo.
 - `POST /api/query` => `{ question, topK }` returns `{ answer, contexts[] }`
 
 ## Notes
-- Embeddings use **HuggingFace transformers** (`text-embedding-dimenssion - 384 ).
+- Embeddings use **HuggingFace transformers** (`text-embedding-model -  Xenova/all-MiniLM-L6-v2   text-embedding-dimenssion - 384 ).
 - OCR via **Tesseract.js** (CPU). For heavy PDFs, ingestion will take longer — consider background jobs.
 - Table extraction is best-effort via OCR/text chunking; charts are handled via OCR and heuristic classification.
 
