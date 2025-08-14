@@ -16,7 +16,7 @@ const uploadsDir = path.join(__dirname, 'uploads');
 const app = express();
 app.use(cors({
   origin: [
-    'https://visual-doc-rag-mern-client.vercel.app/',
+    'https://visual-doc-rag-mern-client.vercel.app',
     'http://localhost:5173'
   ],
   credentials: true, 
