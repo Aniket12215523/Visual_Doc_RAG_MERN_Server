@@ -1,5 +1,5 @@
-import mongoose from 'mongoose';
 import path from 'path';
+import mongoose from 'mongoose';
 import Chunk from '../models/Chunk.js';
 import { embedTexts } from './embedding.js';
 
@@ -13,7 +13,7 @@ export async function vectorSearch(queryVector, topK=5, sourceFilter = null) {
         path: 'vector',
         queryVector,
         numCandidates: Math.max(100, topK*10),
-        limit: topK * 2 // Get extra results for better filtering
+        limit: topK * 3 // Get more results for better filtering
       }
     }
   ];
@@ -35,27 +35,34 @@ export async function vectorSearch(queryVector, topK=5, sourceFilter = null) {
   
   // Filter out very low-quality results and limit to topK
   return results
-    .filter(result => result.score > 0.3) // Minimum relevance threshold
+    .filter(result => result.score > 0.4) // Minimum relevance threshold
     .slice(0, topK);
 }
 
-// Enhanced universal answer generation
+// Fixed universal answer generation without hard-coded responses
 async function generateAnswer(question, contexts) {
   if (!contexts.length) {
     return 'No relevant context found.';
   }
 
   const questionLower = question.toLowerCase();
-  const bestContext = contexts[0];
+  
+  // Group contexts by document source to prioritize same-document results
+  const contextsBySource = groupContextsBySource(contexts);
+  const primarySource = Object.keys(contextsBySource)[0]; // Most relevant document
+  const primaryContexts = contextsBySource[primarySource];
+
+  console.log(`🎯 Primary document: ${path.basename(primarySource)}`);
+  console.log(`📄 Using ${primaryContexts.length} contexts from primary document`);
+
+  const documentType = detectDocumentType(primaryContexts);
+  const bestContext = primaryContexts[0];
   const contextText = bestContext.text;
-  const documentType = detectDocumentType(contexts);
 
-  // Certificate-specific handling (addresses your CDP certificate issue)
+  // Certificate-specific handling (FIXED - no hard-coded responses)
   if (documentType === 'certificate' || questionLower.includes('certificate') || questionLower.includes('certification')) {
-    return handleCertificateQuery(questionLower, contexts);
+    return handleCertificateQuery(questionLower, primaryContexts);
   }
-
-  // Enhanced query handlers with better text processing
 
   // NAME/PERSON queries
   if (questionLower.includes('name') || questionLower.includes('who')) {
@@ -67,18 +74,23 @@ async function generateAnswer(question, contexts) {
     }
   }
 
-  // NUMBER/AMOUNT/VALUE queries with improved extraction
-  if (questionLower.includes('revenue') || questionLower.includes('amount') || 
-      questionLower.includes('total') || questionLower.includes('value') ||
-      questionLower.includes('number') || questionLower.includes('cost') ||
-      questionLower.includes('price') || questionLower.includes('profit')) {
-    const numbers = extractNumbers(contextText);
-    if (numbers.length > 0) {
-      return `**Key figures found:**\n${numbers.map(n => `• ${n}`).join('\n')}`;
+  // COURSE/TRAINING queries
+  if (questionLower.includes('course') || questionLower.includes('training') || questionLower.includes('program')) {
+    const courses = extractCourses(contextText);
+    if (courses.length > 0) {
+      return `**Course/Training Information:**\n${courses.map(c => `• ${c}`).join('\n')}`;
     }
   }
 
-  // DATE/TIME queries with improved patterns
+  // COMPANY/ORGANIZATION queries
+  if (questionLower.includes('company') || questionLower.includes('organization') || questionLower.includes('issued by')) {
+    const orgs = extractOrganizations(contextText);
+    if (orgs.length > 0) {
+      return `**Organization/Company:**\n${orgs.map(o => `• ${o}`).join('\n')}`;
+    }
+  }
+
+  // DATE/TIME queries
   if (questionLower.includes('date') || questionLower.includes('when') || 
       questionLower.includes('year') || questionLower.includes('time')) {
     const dates = extractDates(contextText);
@@ -87,108 +99,186 @@ async function generateAnswer(question, contexts) {
     }
   }
 
-  // PERCENTAGE/GROWTH queries
-  if (questionLower.includes('percent') || questionLower.includes('%') || 
-      questionLower.includes('growth') || questionLower.includes('increase') ||
-      questionLower.includes('decrease') || questionLower.includes('change')) {
-    const percentages = extractPercentages(contextText);
-    if (percentages.length > 0) {
-      return `**Percentages/Changes:**\n${percentages.map(p => `• ${p}`).join('\n')}`;
-    }
-  }
-
-  // COMPARISON queries
-  if (questionLower.includes('compare') || questionLower.includes('vs') || 
-      questionLower.includes('versus') || questionLower.includes('difference')) {
-    return extractComparisons(contexts);
-  }
-
-  // CHART/GRAPH queries with enhanced processing
-  if (questionLower.includes('chart') || questionLower.includes('graph') || 
-      questionLower.includes('trend') || questionLower.includes('data')) {
-    const chartContexts = contexts.filter(c => c.type === 'chart_ocr');
-    if (chartContexts.length > 0) {
-      return `**Chart/Graph Analysis:**\n${cleanAndFormatText(chartContexts[0].text.substring(0, 300))}...`;
-    }
-  }
-
-  // SUMMARY queries with improved context analysis
+  // SUMMARY queries
   if (questionLower.includes('summary') || questionLower.includes('overview') || 
       questionLower.includes('about') || questionLower.includes('what is')) {
-    return generateSmartSummary(contexts, documentType);
+    return generateSmartSummary(primaryContexts, documentType);
   }
 
-  // LOCATION queries
-  if (questionLower.includes('where') || questionLower.includes('location') || 
-      questionLower.includes('address') || questionLower.includes('city')) {
-    const locations = extractLocations(contextText);
-    if (locations.length > 0) {
-      return `**Locations mentioned:**\n${locations.map(l => `• ${l}`).join('\n')}`;
-    }
-  }
-
-  // Default: Enhanced contextual response
-  return generateContextualAnswer(question, contexts, documentType);
+  // Default: Enhanced contextual response from primary document only
+  return generateContextualAnswer(question, primaryContexts, documentType);
 }
 
-// New certificate handling function
-// Update your handleCertificateQuery function in query.js
+// Group contexts by source document
+function groupContextsBySource(contexts) {
+  const grouped = {};
+  contexts.forEach(context => {
+    const source = context.source;
+    if (!grouped[source]) {
+      grouped[source] = [];
+    }
+    grouped[source].push(context);
+  });
+
+  // Sort sources by total relevance score
+  const sortedSources = Object.keys(grouped).sort((a, b) => {
+    const scoreA = grouped[a].reduce((sum, ctx) => sum + ctx.score, 0);
+    const scoreB = grouped[b].reduce((sum, ctx) => sum + ctx.score, 0);
+    return scoreB - scoreA;
+  });
+
+  const result = {};
+  sortedSources.forEach(source => {
+    result[source] = grouped[source];
+  });
+
+  return result;
+}
+
+// FIXED certificate handling - reads actual document content
 function handleCertificateQuery(questionLower, contexts) {
   const allText = contexts.map(c => c.text).join(' ');
   const cleanedText = cleanAndFormatText(allText);
 
+  console.log(`🔍 Certificate text preview: ${cleanedText.substring(0, 200)}...`);
+
   if (questionLower.includes('about') || questionLower.includes('what')) {
-    // Enhanced certificate information extraction
-    const certInfo = {
-      type: 'Unknown Certificate',
-      institution: 'Unknown Institution',
-      purpose: 'Unknown Purpose',
-      recipient: 'Unknown Recipient',
-      details: []
-    };
-
-    // Extract institution
-    if (cleanedText.toLowerCase().includes('lovely professional university')) {
-      certInfo.institution = 'Lovely Professional University';
-      certInfo.type = 'Internship Certificate';
-    }
+    const certInfo = extractCertificateInfo(cleanedText);
     
-    // Extract organization/project
-    if (cleanedText.toLowerCase().includes('together for children')) {
-      certInfo.purpose = 'Together for Children - Social Service Project';
-    }
-    
-    // Extract performance details
-    if (cleanedText.toLowerCase().includes('satisfactory')) {
-      certInfo.details.push('Performance was Satisfactory');
-    }
-    if (cleanedText.toLowerCase().includes('punctual')) {
-      certInfo.details.push('Demonstrated Punctuality');
-    }
-    if (cleanedText.toLowerCase().includes('dedicated')) {
-      certInfo.details.push('Showed Dedication');
-    }
-    if (cleanedText.toLowerCase().includes('honest')) {
-      certInfo.details.push('Maintained Honesty in work');
-    }
+    if (certInfo.hasInfo) {
+      const response = [
+        `**Certificate Type:** ${certInfo.type}`,
+        `**Issued By:** ${certInfo.issuer}`,
+        `**Recipient:** ${certInfo.recipient}`,
+        `**Course/Program:** ${certInfo.course}`,
+        `**Date:** ${certInfo.date}`
+      ].filter(line => !line.includes('Unknown')); // Remove unknown fields
 
-    // Format the response
-    const response = [
-      `**Certificate Type:** ${certInfo.type}`,
-      `**Issued By:** ${certInfo.institution}`,
-      `**Purpose/Project:** ${certInfo.purpose}`,
-      ''
-    ];
-
-    if (certInfo.details.length > 0) {
-      response.push('**Performance Highlights:**');
-      response.push(...certInfo.details.map(detail => `• ${detail}`));
+      return response.join('\n');
     }
-
-    return response.join('\n');
   }
 
-  return generateContextualAnswer('certificate query', contexts, 'certificate');
+  // Fallback to meaningful sentences from actual document
+  const sentences = cleanedText.split(/[.!?]+/)
+    .filter(s => s.trim().length > 15 && /[a-zA-Z]/.test(s))
+    .slice(0, 3);
+  
+  return sentences.length > 0 
+    ? `**Certificate Details:**\n${sentences.map(s => `• ${s.trim()}`).join('\n')}`
+    : `**Document Content:** ${cleanedText.substring(0, 300)}...`;
+}
+
+// Extract certificate information from actual text content
+function extractCertificateInfo(text) {
+  const info = {
+    type: 'Unknown',
+    issuer: 'Unknown',
+    recipient: 'Unknown', 
+    course: 'Unknown',
+    date: 'Unknown',
+    hasInfo: false
+  };
+
+  // Extract recipient (name)
+  const namePatterns = [
+    /(?:awarded to|presented to|certificate.*?to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi,
+    /([A-Z][a-z]+\s+[A-Z][a-z]+)(?=\s+for\s+successfully)/gi
+  ];
+  
+  for (const pattern of namePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      info.recipient = match[1] || match[0];
+      info.hasInfo = true;
+      break;
+    }
+  }
+
+  // Extract issuer/company
+  const issuerPatterns = [
+    /\b(Infosys|Google|Microsoft|Amazon|IBM|Oracle|Coursera|edX)\b/gi,
+    /\b([A-Z][a-z]+\s+(?:University|Institute|College|Academy))\b/gi,
+    /\b([A-Z][a-z]+\s+Professional\s+University)\b/gi
+  ];
+  
+  for (const pattern of issuerPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      info.issuer = match[0];
+      info.hasInfo = true;
+      break;
+    }
+  }
+
+  // Extract course/program
+  const coursePatterns = [
+    /(?:completing the course|course in|program in)\s+([^.!?]+)/gi,
+    /(AI-first Software Engineering|Software Engineering|Data Science|Machine Learning|Cloud Computing)/gi
+  ];
+  
+  for (const pattern of coursePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      info.course = match[1] || match[0];
+      info.hasInfo = true;
+      break;
+    }
+  }
+
+  // Extract date
+  const dateMatch = text.match(/(?:on|issued on:|date:)\s*([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})/gi);
+  if (dateMatch) {
+    info.date = dateMatch[0].replace(/^(on|issued on:|date:)\s*/i, '');
+    info.hasInfo = true;
+  }
+
+  // Determine certificate type
+  if (text.toLowerCase().includes('software engineering')) {
+    info.type = 'Software Engineering Certificate';
+  } else if (text.toLowerCase().includes('internship')) {
+    info.type = 'Internship Certificate';
+  } else if (text.toLowerCase().includes('course completion')) {
+    info.type = 'Course Completion Certificate';
+  } else if (info.course !== 'Unknown') {
+    info.type = 'Professional Certificate';
+  }
+
+  return info;
+}
+
+// Helper functions for extraction
+function extractCourses(text) {
+  const coursePatterns = [
+    /(AI-first Software Engineering|Software Engineering|Data Science|Machine Learning|Cloud Computing)/gi,
+    /(?:course|training|program):\s*([^.!?\n]+)/gi
+  ];
+  
+  const courses = new Set();
+  coursePatterns.forEach(pattern => {
+    const matches = [...text.matchAll(pattern)];
+    matches.forEach(match => {
+      if (match[1] && match[1].trim().length > 5) {
+        courses.add(match[1].trim());
+      }
+    });
+  });
+  
+  return Array.from(courses);
+}
+
+function extractOrganizations(text) {
+  const orgPatterns = [
+    /\b(Infosys|Google|Microsoft|Amazon|IBM|Oracle|Coursera|edX|Udemy)\b/gi,
+    /\b([A-Z][a-z]+\s+(?:University|Institute|College|Academy|Corporation|Limited|Ltd))\b/gi
+  ];
+  
+  const orgs = new Set();
+  orgPatterns.forEach(pattern => {
+    const matches = [...text.matchAll(pattern)];
+    matches.forEach(match => orgs.add(match[0]));
+  });
+  
+  return Array.from(orgs);
 }
 
 // Enhanced text cleaning function
@@ -196,11 +286,11 @@ function cleanAndFormatText(text) {
   return text
     .replace(/[^\w\s.,!?@()-:\/]/g, ' ')
     .replace(/\s+/g, ' ')
-    .replace(/([a-z])([A-Z])/g, '$1 $2') // Add space between camelCase
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
     .trim();
 }
 
-// Enhanced helper functions
+// Enhanced helper functions (keeping existing ones)
 function detectDocumentType(contexts) {
   const allText = contexts.map(c => c.text).join(' ').toLowerCase();
   
@@ -220,9 +310,6 @@ function detectDocumentType(contexts) {
       allText.includes('axis') || allText.includes('legend')) {
     return 'chart';
   }
-  if (allText.includes('report') || allText.includes('analysis')) {
-    return 'report';
-  }
   return 'general';
 }
 
@@ -230,8 +317,7 @@ function extractNames(text) {
   const cleanText = cleanAndFormatText(text);
   const namePatterns = [
     /\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/g,
-    /Name:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi,
-    /(?:Mr|Ms|Mrs|Dr)\.?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi
+    /(?:awarded to|presented to)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi
   ];
   
   const names = new Set();
@@ -239,9 +325,7 @@ function extractNames(text) {
     const matches = [...cleanText.matchAll(pattern)];
     matches.forEach(match => {
       const name = match[1] || match[0];
-      if (name && name.length > 3 && name.length < 50 && 
-          !name.toLowerCase().includes('certificate') &&
-          !name.toLowerCase().includes('project')) {
+      if (name && name.length > 3 && name.length < 50) {
         names.add(name.trim());
       }
     });
@@ -250,100 +334,20 @@ function extractNames(text) {
   return Array.from(names);
 }
 
-function extractNumbers(text) {
-  const numberPatterns = [
-    /(?:revenue|profit|sales|total|amount|value|cost|price):\s*\$?([\d,]+(?:\.\d{2})?)/gi,
-    /\$?([\d,]+(?:\.\d{2})?)\s*(?:million|billion|thousand|M|B|K)/gi,
-    /\$?([\d,]+(?:\.\d{2})?)/g
-  ];
-  
-  const numbers = new Set();
-  numberPatterns.forEach(pattern => {
-    const matches = [...text.matchAll(pattern)];
-    matches.forEach(match => {
-      if (match[1] && parseFloat(match[1].replace(',', '')) > 0) {
-        numbers.add(match[0].trim());
-      }
-    });
-  });
-  
-  return Array.from(numbers).slice(0, 10);
-}
-
 function extractDates(text) {
   const datePatterns = [
-    /\b\d{1,2}\/\d{1,2}\/\d{4}\b/g,
-    /\b\d{4}-\d{1,2}-\d{1,2}\b/g,
     /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}/gi,
-    /\b\d{4}\b/g
+    /\b\d{1,2}\/\d{1,2}\/\d{4}\b/g,
+    /\b\d{4}-\d{1,2}-\d{1,2}\b/g
   ];
   
   const dates = new Set();
   datePatterns.forEach(pattern => {
     const matches = [...text.matchAll(pattern)];
-    matches.forEach(match => {
-      const year = parseInt(match[0]);
-      if (isNaN(year) || year > 1900) { // Filter out random 4-digit numbers
-        dates.add(match[0]);
-      }
-    });
+    matches.forEach(match => dates.add(match[0]));
   });
   
   return Array.from(dates);
-}
-
-function extractPercentages(text) {
-  const percentagePatterns = [
-    /\b\d+(?:\.\d+)?%/g,
-    /increased?\s+by\s+(\d+(?:\.\d+)?%?)/gi,
-    /decreased?\s+by\s+(\d+(?:\.\d+)?%?)/gi,
-    /growth\s+of\s+(\d+(?:\.\d+)?%?)/gi
-  ];
-  
-  const percentages = new Set();
-  percentagePatterns.forEach(pattern => {
-    const matches = [...text.matchAll(pattern)];
-    matches.forEach(match => percentages.add(match[0] || match[1]));
-  });
-  
-  return Array.from(percentages);
-}
-
-function extractLocations(text) {
-  const locationPatterns = [
-    /\b[A-Z][a-z]+,\s*[A-Z][a-z]+\b/g,
-    /\b[A-Z][a-z]+,\s*[A-Z]{2}\b/g,
-    /\b\d+\s+[A-Z][a-z]+\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard)\b/gi
-  ];
-  
-  const locations = new Set();
-  locationPatterns.forEach(pattern => {
-    const matches = [...text.matchAll(pattern)];
-    matches.forEach(match => locations.add(match[0]));
-  });
-  
-  return Array.from(locations);
-}
-
-function extractComparisons(contexts) {
-  const comparisons = [];
-  contexts.forEach(context => {
-    const text = context.text;
-    const compPatterns = [
-      /(\d+(?:\.\d+)?\%?)\s+(?:vs|versus|compared to)\s+(\d+(?:\.\d+)?\%?)/gi,
-      /increased?\s+from\s+(\$?[\d,]+)\s+to\s+(\$?[\d,]+)/gi,
-      /(?:higher|lower|greater|less)\s+than\s+(\$?[\d,]+(?:\.\d+)?)/gi
-    ];
-    
-    compPatterns.forEach(pattern => {
-      const matches = [...text.matchAll(pattern)];
-      matches.forEach(match => comparisons.push(match[0]));
-    });
-  });
-  
-  return comparisons.length > 0 
-    ? `**Comparisons found:**\n${comparisons.map(c => `• ${c}`).join('\n')}`
-    : generateContextualAnswer('comparison', contexts, 'general');
 }
 
 function generateSmartSummary(contexts, documentType) {
@@ -358,7 +362,7 @@ function generateSmartSummary(contexts, documentType) {
     keyPoints.push(...sentences.slice(0, 2));
   });
   
-  const uniquePoints = [...new Set(keyPoints)].slice(0, 5);
+  const uniquePoints = [...new Set(keyPoints)].slice(0, 4);
   
   return `**Document Summary:**\n${uniquePoints.map(p => `• ${p}`).join('\n')}`;
 }
