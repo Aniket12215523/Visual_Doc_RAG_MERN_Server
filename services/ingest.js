@@ -51,165 +51,66 @@ class NodeCanvasFactory {
   }
 }
 
-// Enhanced OCR function with multiple preprocessing approaches
+// Fast OCR function optimized for speed
 async function ocrBuffer(buf, isChart = false) {
   try {
-    // Multiple preprocessing approaches for better OCR
-    const preprocessing = [
-      // Approach 1: High contrast with sharpening
-      sharp(buf)
-        .resize({ width: 3000, height: null, withoutEnlargement: false })
-        .normalize()
-        .sharpen({ sigma: 1.5 })
-        .threshold(128)
-        .png({ quality: 100 }),
-      
-      // Approach 2: Gamma correction with blur reduction  
-      sharp(buf)
-        .resize({ width: 2500, height: null, withoutEnlargement: false })
-        .gamma(1.5)
-        .sharpen()
-        .normalize()
-        .png({ quality: 100 }),
-      
-      // Approach 3: Edge enhancement
-      sharp(buf)
-        .resize({ width: 2000, height: null, withoutEnlargement: false })
-        .modulate({ brightness: 1.2, saturation: 0 }) // Convert to grayscale with brightness
-        .sharpen({ sigma: 1.0 })
-        .png({ quality: 100 })
-    ];
+    // Get image metadata first to make smart decisions
+    const image = sharp(buf);
+    const metadata = await image.metadata();
+    
+    // Determine optimal size (don't go over 1500px for speed)
+    let targetWidth = Math.min(metadata.width || 1000, 1500);
+    let targetHeight = Math.min(metadata.height || 1000, 1500);
+    
+    // Single, optimized preprocessing pipeline
+    const processedBuffer = await image
+      .resize(targetWidth, targetHeight, { 
+        fit: 'inside',
+        withoutEnlargement: true 
+      })
+      .greyscale() // Convert to greyscale for faster processing
+      .normalize() // Auto-adjust contrast
+      .sharpen({ sigma: 1.0 }) // Light sharpening
+      .png({ quality: 90 }) // Use PNG for better OCR
+      .toBuffer();
 
-    let bestText = '';
-    let bestScore = 0;
+    console.log(`OCR processing image: ${targetWidth}x${targetHeight}px`);
 
-    // Try each preprocessing approach
-    for (let i = 0; i < preprocessing.length; i++) {
-      try {
-        const processedBuffer = await preprocessing[i].toBuffer();
-        
-        // Multiple OCR configurations
-        const ocrConfigs = [
-          {
-            tessedit_pageseg_mode: Tesseract.PSM.AUTO,
-            tessedit_ocr_engine_mode: Tesseract.OEM.LSTM_ONLY,
-            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?@()[]{}:;-_/\\%$#&+=*"\''
-          },
-          {
-            tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK,
-            tessedit_ocr_engine_mode: Tesseract.OEM.LSTM_ONLY,
-            preserve_interword_spaces: 1
-          },
-          {
-            tessedit_pageseg_mode: Tesseract.PSM.SINGLE_COLUMN,
-            tessedit_ocr_engine_mode: Tesseract.OEM.DEFAULT
-          }
-        ];
+    // Single, optimized Tesseract configuration
+    const { data: { text, confidence } } = await Tesseract.recognize(processedBuffer, 'eng', {
+      logger: () => {},
+      tessedit_pageseg_mode: isChart ? Tesseract.PSM.AUTO : Tesseract.PSM.SINGLE_BLOCK,
+      tessedit_ocr_engine_mode: Tesseract.OEM.LSTM_ONLY,
+      // Speed optimizations
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?@()[]{}:;-_/\\%$#&+=*"\'',
+      preserve_interword_spaces: 1
+    });
 
-        for (const config of ocrConfigs) {
-          const { data: { text, confidence } } = await Tesseract.recognize(processedBuffer, 'eng', {
-            logger: () => {},
-            ...config
-          });
-
-          if (confidence > bestScore) {
-            bestScore = confidence;
-            bestText = text || '';
-          }
-        }
-      } catch (error) {
-        console.warn(`OCR preprocessing approach ${i + 1} failed:`, error.message);
-        continue;
-      }
-    }
-
-    // Clean and post-process the best result
-    const cleanedText = enhancedCleanOCRText(bestText);
-    console.log(`OCR confidence: ${bestScore}%`);
+    console.log(`OCR completed with ${confidence}% confidence`);
+    
+    // Quick text cleaning (much simpler than before)
+    const cleanedText = text
+      .replace(/\s+/g, ' ')
+      .replace(/[^\w\s.,!?@()-:\/&%]/g, ' ')
+      .trim();
     
     return cleanedText;
     
   } catch (error) {
-    console.warn('All OCR preprocessing failed, using basic OCR:', error);
+    console.warn('Fast OCR failed, using basic fallback:', error.message);
     
-    // Final fallback
+    // Ultra-simple fallback
     try {
-      const { data: { text } } = await Tesseract.recognize(buf, 'eng', { 
+      const { data: { text } } = await Tesseract.recognize(buf, 'eng', {
         logger: () => {},
         tessedit_pageseg_mode: Tesseract.PSM.AUTO
       });
-      return enhancedCleanOCRText(text || '');
+      return text?.replace(/\s+/g, ' ').trim() || '';
     } catch (fallbackError) {
-      console.error('OCR completely failed:', fallbackError);
+      console.error('All OCR attempts failed:', fallbackError);
       return '';
     }
   }
-}
-
-// Enhanced text cleaning with pattern recognition
-function enhancedCleanOCRText(text) {
-  let cleaned = text
-    // Fix common OCR character substitutions
-    .replace(/[|]/g, 'I')
-    .replace(/[¡]/g, 'i')
-    .replace(/[°]/g, 'o')
-    .replace(/[©]/g, 'c')
-    .replace(/[®]/g, 'r')
-    .replace(/[™]/g, 'tm')
-    
-    // Fix spacing issues
-    .replace(/\s+/g, ' ')
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
-    
-    // Remove obvious OCR garbage
-    .replace(/[^\w\s.,!?@()-:\/&%]/g, ' ')
-    .replace(/\b[a-z]\b/g, '') // Remove isolated single letters (except I, a)
-    .replace(/\b\d{1}\b/g, '') // Remove isolated single digits
-    
-    // Normalize punctuation
-    .replace(/[.]{2,}/g, '.')
-    .replace(/[,]{2,}/g, ',')
-    
-    // Fix common word patterns for certificates
-    .replace(/\bGertiricate\b/gi, 'Certificate')
-    .replace(/\bls\s+Presented\b/gi, 'is Presented')
-    .replace(/\bINIVERSITY\b/gi, 'UNIVERSITY')
-    .replace(/\bINSTITUTE\b/gi, 'INSTITUTE')
-    .replace(/\bPROFESSIONAL\b/gi, 'PROFESSIONAL')
-    .replace(/\bSatisfactory\b/gi, 'Satisfactory')
-    .replace(/\bPunctual\b/gi, 'Punctual')
-    .replace(/\bDedicated\b/gi, 'Dedicated')
-    .replace(/\bHonest\b/gi, 'Honest')
-    .replace(/\binternship\b/gi, 'internship')
-    .replace(/\bperformance\b/gi, 'performance')
-    
-    .trim();
-
-  // Try to reconstruct meaningful sentences
-  const sentences = cleaned.split(/[.!?]+/).map(sentence => {
-    let s = sentence.trim();
-    
-    // Fix sentence patterns
-    if (s.includes('together for children')) {
-      s = s.replace(/.*together for children.*/, 'Together for Children organization');
-    }
-    
-    if (s.includes('Certificate') && s.includes('Presented')) {
-      s = 'This Certificate is Presented';
-    }
-    
-    if (s.includes('LOVELY') && s.includes('PROFESSIONAL')) {
-      s = 'Lovely Professional University';
-    }
-    
-    if (s.includes('Performance') && s.includes('Satisfactory')) {
-      s = 'Performance was Satisfactory. Student was Punctual, Dedicated and Honest';
-    }
-    
-    return s;
-  }).filter(s => s.length > 5);
-
-  return sentences.join('. ').trim();
 }
 
 function classifyKind(textLower) {
@@ -252,7 +153,7 @@ export async function processFileAndIndex(filePath, docId, mimetype, progressCal
       for (let p = 1; p <= pdf.numPages; p++) {
         try {
           const page = await pdf.getPage(p);
-          const viewport = page.getViewport({ scale: 2.5 }); // Increased scale for better OCR
+          const viewport = page.getViewport({ scale: 2.0 }); // Reduced from 2.5 to 2.0
           const canvasFactory = new NodeCanvasFactory();
           const canvasAndContext = canvasFactory.create(viewport.width, viewport.height);
           
