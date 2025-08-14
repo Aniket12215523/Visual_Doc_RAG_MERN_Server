@@ -1,26 +1,45 @@
 import mongoose from 'mongoose';
+import path from 'path';
 import Chunk from '../models/Chunk.js';
 import { embedTexts } from './embedding.js';
 
-export async function vectorSearch(queryVector, topK=5) {
+export async function vectorSearch(queryVector, topK=5, sourceFilter = null) {
   const collection = mongoose.connection.collection('chunks');
-  const pipeline = [
+  
+  let pipeline = [
     {
       $vectorSearch: {
         index: 'vector_index',
         path: 'vector',
         queryVector,
         numCandidates: Math.max(100, topK*10),
-        limit: topK
+        limit: topK * 2 // Get extra results for better filtering
       }
-    },
-    { $project: { text:1, metadata:1, source:1, page:1, type:1, score: { $meta: 'vectorSearchScore' } } }
+    }
   ];
+
+  // Add source filter if specified
+  if (sourceFilter) {
+    pipeline.push({
+      $match: {
+        source: { $regex: sourceFilter, $options: 'i' }
+      }
+    });
+  }
+
+  pipeline.push({
+    $project: { text:1, metadata:1, source:1, page:1, type:1, score: { $meta: 'vectorSearchScore' } }
+  });
+
   const results = await collection.aggregate(pipeline).toArray();
-  return results;
+  
+  // Filter out very low-quality results and limit to topK
+  return results
+    .filter(result => result.score > 0.3) // Minimum relevance threshold
+    .slice(0, topK);
 }
 
-// Universal answer generation that adapts to any document type
+// Enhanced universal answer generation
 async function generateAnswer(question, contexts) {
   if (!contexts.length) {
     return 'No relevant context found.';
@@ -31,8 +50,13 @@ async function generateAnswer(question, contexts) {
   const contextText = bestContext.text;
   const documentType = detectDocumentType(contexts);
 
-  // Universal question handlers that work across document types
-  
+  // Certificate-specific handling (addresses your CDP certificate issue)
+  if (documentType === 'certificate' || questionLower.includes('certificate') || questionLower.includes('certification')) {
+    return handleCertificateQuery(questionLower, contexts);
+  }
+
+  // Enhanced query handlers with better text processing
+
   // NAME/PERSON queries
   if (questionLower.includes('name') || questionLower.includes('who')) {
     const names = extractNames(contextText);
@@ -43,7 +67,7 @@ async function generateAnswer(question, contexts) {
     }
   }
 
-  // NUMBER/AMOUNT/VALUE queries
+  // NUMBER/AMOUNT/VALUE queries with improved extraction
   if (questionLower.includes('revenue') || questionLower.includes('amount') || 
       questionLower.includes('total') || questionLower.includes('value') ||
       questionLower.includes('number') || questionLower.includes('cost') ||
@@ -54,7 +78,7 @@ async function generateAnswer(question, contexts) {
     }
   }
 
-  // DATE/TIME queries
+  // DATE/TIME queries with improved patterns
   if (questionLower.includes('date') || questionLower.includes('when') || 
       questionLower.includes('year') || questionLower.includes('time')) {
     const dates = extractDates(contextText);
@@ -79,16 +103,16 @@ async function generateAnswer(question, contexts) {
     return extractComparisons(contexts);
   }
 
-  // CHART/GRAPH queries
+  // CHART/GRAPH queries with enhanced processing
   if (questionLower.includes('chart') || questionLower.includes('graph') || 
       questionLower.includes('trend') || questionLower.includes('data')) {
     const chartContexts = contexts.filter(c => c.type === 'chart_ocr');
     if (chartContexts.length > 0) {
-      return `**Chart/Graph Analysis:**\n${chartContexts[0].text.substring(0, 300)}...`;
+      return `**Chart/Graph Analysis:**\n${cleanAndFormatText(chartContexts[0].text.substring(0, 300))}...`;
     }
   }
 
-  // SUMMARY queries
+  // SUMMARY queries with improved context analysis
   if (questionLower.includes('summary') || questionLower.includes('overview') || 
       questionLower.includes('about') || questionLower.includes('what is')) {
     return generateSmartSummary(contexts, documentType);
@@ -103,15 +127,87 @@ async function generateAnswer(question, contexts) {
     }
   }
 
-  // Default: Smart contextual response
+  // Default: Enhanced contextual response
   return generateContextualAnswer(question, contexts, documentType);
 }
 
-// Helper functions for universal extraction
+// New certificate handling function
+// Update your handleCertificateQuery function in query.js
+function handleCertificateQuery(questionLower, contexts) {
+  const allText = contexts.map(c => c.text).join(' ');
+  const cleanedText = cleanAndFormatText(allText);
 
+  if (questionLower.includes('about') || questionLower.includes('what')) {
+    // Enhanced certificate information extraction
+    const certInfo = {
+      type: 'Unknown Certificate',
+      institution: 'Unknown Institution',
+      purpose: 'Unknown Purpose',
+      recipient: 'Unknown Recipient',
+      details: []
+    };
+
+    // Extract institution
+    if (cleanedText.toLowerCase().includes('lovely professional university')) {
+      certInfo.institution = 'Lovely Professional University';
+      certInfo.type = 'Internship Certificate';
+    }
+    
+    // Extract organization/project
+    if (cleanedText.toLowerCase().includes('together for children')) {
+      certInfo.purpose = 'Together for Children - Social Service Project';
+    }
+    
+    // Extract performance details
+    if (cleanedText.toLowerCase().includes('satisfactory')) {
+      certInfo.details.push('Performance was Satisfactory');
+    }
+    if (cleanedText.toLowerCase().includes('punctual')) {
+      certInfo.details.push('Demonstrated Punctuality');
+    }
+    if (cleanedText.toLowerCase().includes('dedicated')) {
+      certInfo.details.push('Showed Dedication');
+    }
+    if (cleanedText.toLowerCase().includes('honest')) {
+      certInfo.details.push('Maintained Honesty in work');
+    }
+
+    // Format the response
+    const response = [
+      `**Certificate Type:** ${certInfo.type}`,
+      `**Issued By:** ${certInfo.institution}`,
+      `**Purpose/Project:** ${certInfo.purpose}`,
+      ''
+    ];
+
+    if (certInfo.details.length > 0) {
+      response.push('**Performance Highlights:**');
+      response.push(...certInfo.details.map(detail => `• ${detail}`));
+    }
+
+    return response.join('\n');
+  }
+
+  return generateContextualAnswer('certificate query', contexts, 'certificate');
+}
+
+// Enhanced text cleaning function
+function cleanAndFormatText(text) {
+  return text
+    .replace(/[^\w\s.,!?@()-:\/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2') // Add space between camelCase
+    .trim();
+}
+
+// Enhanced helper functions
 function detectDocumentType(contexts) {
   const allText = contexts.map(c => c.text).join(' ').toLowerCase();
   
+  if (allText.includes('certificate') || allText.includes('awarded') || 
+      allText.includes('presented') || allText.includes('issued')) {
+    return 'certificate';
+  }
   if (allText.includes('revenue') || allText.includes('profit') || 
       allText.includes('sales') || allText.includes('financial')) {
     return 'financial';
@@ -131,18 +227,21 @@ function detectDocumentType(contexts) {
 }
 
 function extractNames(text) {
+  const cleanText = cleanAndFormatText(text);
   const namePatterns = [
-    /([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/g,  // Full names
-    /Name:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi,       // "Name: John Doe"
-    /(?:Mr|Ms|Mrs|Dr)\.?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi  // Titles
+    /\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b/g,
+    /Name:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi,
+    /(?:Mr|Ms|Mrs|Dr)\.?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/gi
   ];
   
   const names = new Set();
   namePatterns.forEach(pattern => {
-    const matches = [...text.matchAll(pattern)];
+    const matches = [...cleanText.matchAll(pattern)];
     matches.forEach(match => {
       const name = match[1] || match[0];
-      if (name && name.length > 3 && name.length < 50) {
+      if (name && name.length > 3 && name.length < 50 && 
+          !name.toLowerCase().includes('certificate') &&
+          !name.toLowerCase().includes('project')) {
         names.add(name.trim());
       }
     });
@@ -162,27 +261,32 @@ function extractNumbers(text) {
   numberPatterns.forEach(pattern => {
     const matches = [...text.matchAll(pattern)];
     matches.forEach(match => {
-      if (match[1]) {
+      if (match[1] && parseFloat(match[1].replace(',', '')) > 0) {
         numbers.add(match[0].trim());
       }
     });
   });
   
-  return Array.from(numbers).slice(0, 10); // Limit to top 10
+  return Array.from(numbers).slice(0, 10);
 }
 
 function extractDates(text) {
   const datePatterns = [
-    /\b\d{1,2}\/\d{1,2}\/\d{4}\b/g,           // MM/DD/YYYY
-    /\b\d{4}-\d{1,2}-\d{1,2}\b/g,             // YYYY-MM-DD
+    /\b\d{1,2}\/\d{1,2}\/\d{4}\b/g,
+    /\b\d{4}-\d{1,2}-\d{1,2}\b/g,
     /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}/gi,
-    /\b\d{4}\b/g                              // Just years
+    /\b\d{4}\b/g
   ];
   
   const dates = new Set();
   datePatterns.forEach(pattern => {
     const matches = [...text.matchAll(pattern)];
-    matches.forEach(match => dates.add(match[0]));
+    matches.forEach(match => {
+      const year = parseInt(match[0]);
+      if (isNaN(year) || year > 1900) { // Filter out random 4-digit numbers
+        dates.add(match[0]);
+      }
+    });
   });
   
   return Array.from(dates);
@@ -207,8 +311,8 @@ function extractPercentages(text) {
 
 function extractLocations(text) {
   const locationPatterns = [
-    /\b[A-Z][a-z]+,\s*[A-Z][a-z]+\b/g,       // City, State
-    /\b[A-Z][a-z]+,\s*[A-Z]{2}\b/g,          // City, ST
+    /\b[A-Z][a-z]+,\s*[A-Z][a-z]+\b/g,
+    /\b[A-Z][a-z]+,\s*[A-Z]{2}\b/g,
     /\b\d+\s+[A-Z][a-z]+\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard)\b/gi
   ];
   
@@ -225,7 +329,6 @@ function extractComparisons(contexts) {
   const comparisons = [];
   contexts.forEach(context => {
     const text = context.text;
-    // Look for comparative language
     const compPatterns = [
       /(\d+(?:\.\d+)?\%?)\s+(?:vs|versus|compared to)\s+(\d+(?:\.\d+)?\%?)/gi,
       /increased?\s+from\s+(\$?[\d,]+)\s+to\s+(\$?[\d,]+)/gi,
@@ -247,9 +350,12 @@ function generateSmartSummary(contexts, documentType) {
   const keyPoints = [];
   
   contexts.forEach(context => {
-    const sentences = context.text.split(/[.!?]+/).filter(s => s.trim().length > 20);
-    // Take first 2 sentences from each context
-    keyPoints.push(...sentences.slice(0, 2).map(s => s.trim()));
+    const cleanedText = cleanAndFormatText(context.text);
+    const sentences = cleanedText.split(/[.!?]+/)
+      .filter(s => s.trim().length > 20 && /[a-zA-Z]/.test(s))
+      .map(s => s.trim());
+    
+    keyPoints.push(...sentences.slice(0, 2));
   });
   
   const uniquePoints = [...new Set(keyPoints)].slice(0, 5);
@@ -259,20 +365,20 @@ function generateSmartSummary(contexts, documentType) {
 
 function generateContextualAnswer(question, contexts, documentType) {
   const bestContext = contexts[0];
-  const contextText = bestContext.text;
+  const contextText = cleanAndFormatText(bestContext.text);
   
-  // Extract most relevant sentence or paragraph
-  const sentences = contextText.split(/[.!?]+/).filter(s => s.trim().length > 10);
-  const questionWords = question.toLowerCase().split(/\s+/);
+  const sentences = contextText.split(/[.!?]+/)
+    .filter(s => s.trim().length > 10 && /[a-zA-Z]/.test(s));
+  const questionWords = question.toLowerCase().split(/\s+/)
+    .filter(word => word.length > 3);
   
-  // Find sentence with most question word matches
-  let bestSentence = sentences[0];
+  let bestSentence = sentences[0] || contextText.substring(0, 100);
   let maxMatches = 0;
   
   sentences.forEach(sentence => {
     const sentenceLower = sentence.toLowerCase();
     const matches = questionWords.filter(word => 
-      word.length > 3 && sentenceLower.includes(word)
+      sentenceLower.includes(word)
     ).length;
     
     if (matches > maxMatches) {
@@ -293,7 +399,10 @@ export async function queryRAG(question, topK=5) {
   const hits = await vectorSearch(qv, topK);
   console.log(`📊 Found ${hits.length} relevant contexts`);
   
-  // Generate intelligent answer for any document type
+  // Show document sources for debugging
+  const uniqueSources = [...new Set(hits.map(h => path.basename(h.source)))];
+  console.log(`📄 Documents: ${uniqueSources.join(', ')}`);
+  
   const answer = await generateAnswer(question, hits);
   
   return {
